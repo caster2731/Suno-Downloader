@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Suno Downloader - 楽曲・公式アートワーク高音質ダウンローダー</title>
+  <meta name="description" content="Sunoの楽曲URLから曲名、アーティスト名、公式アートワーク（ジャケット写真）を自動取得し、MP3またはM4A形式で一括ダウンロードできるツールです。">
+  <!-- Google Fonts: Outfit & Noto Sans JP -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700;800&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 背景のネオングラデーションオーブ -->
+  <div class="glow-orb orb-1"></div>
+  <div class="glow-orb orb-2"></div>
+  <div class="glow-orb orb-3"></div>
+
+  <div class="app-container">
+    <!-- ヘッダー -->
+    <header class="app-header">
+      <div class="brand-badge">
+        <span class="pulse-dot"></span>
+        <span>Suno Downloader v1.0</span>
+      </div>
+      <h1 class="main-title">
+        <span class="gradient-text">Suno</span> Music Downloader
+      </h1>
+      <p class="subtitle">
+        URLを貼るだけで、曲名・アーティスト名・公式ジャケット写真を自動取得。<br>
+        メタデータ＆アートワークを完全埋め込みした <strong>MP3 / M4A</strong> で一括保存できます。
+      </p>
+    </header>
+
+    <!-- 入力カードセクション -->
+    <section class="card input-card">
+      <div class="card-header">
+        <div class="card-title-group">
+          <div class="icon-bubble">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+              <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+            </svg>
+          </div>
+          <div>
+            <h2 class="card-title">Sunoの楽曲URLを入力</h2>
+            <p class="card-caption">1行に1つのURL（複数行貼り付け対応、プレイリストやID直接入力も可）</p>
+          </div>
+        </div>
+        <div class="header-actions">
+          <button id="btn-sample" class="btn btn-ghost btn-sm" title="テスト用サンプルURLを挿入">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+            サンプルURLを入力
+          </button>
+          <button id="btn-clear-input" class="btn btn-ghost btn-sm" title="入力をクリア">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+            クリア
+          </button>
+        </div>
+      </div>
+
+      <div class="textarea-wrapper">
+        <textarea id="url-input" class="modern-textarea" rows="4" placeholder="例:
+https://suno.com/song/2e0eec9e-4f86-46c5-9a43-508829fb9d0b
+https://suno.com/song/7b30e35a-f3d0-4340-9087-26b0db791ffa"></textarea>
+      </div>
+
+      <div class="input-bottom-bar">
+        <div class="format-global-selector">
+          <span class="selector-label">一括ダウンロード形式:</span>
+          <div class="segmented-control">
+            <input type="radio" id="format-mp3" name="global-format" value="mp3" checked>
+            <label for="format-mp3">MP3 (320kbps)</label>
+            <input type="radio" id="format-m4a" name="global-format" value="m4a">
+            <label for="format-m4a">M4A (ロスレスAAC)</label>
+          </div>
+        </div>
+
+        <button id="btn-fetch" class="btn btn-primary btn-glow">
+          <svg class="icon-spin-target" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <span id="btn-fetch-text">楽曲情報を取得する</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- 保存先フォルダ & クイックバー -->
+    <section class="folder-bar">
+      <div class="folder-info">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+        </svg>
+        <span class="folder-label">保存先:</span>
+        <span id="dest-path-display" class="folder-path" title="クリックで保存先フォルダを開きます">読み込み中...</span>
+      </div>
+      <button id="btn-open-folder" class="btn btn-ghost btn-sm" title="Windowsエクスプローラーで保存先を開く">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+          <polyline points="15 3 21 3 21 9"></polyline>
+          <line x1="10" y1="14" x2="21" y2="3"></line>
+        </svg>
+        保存フォルダを開く
+      </button>
+    </section>
+
+    <!-- 解析結果一覧セクション -->
+    <section id="results-section" class="card results-card" style="display: none;">
+      <div class="results-header">
+        <div class="results-title-group">
+          <h2 class="card-title">取得した楽曲リスト</h2>
+          <span id="song-count-badge" class="badge">0 曲</span>
+        </div>
+        <div class="results-actions">
+          <button id="btn-clear-all" class="btn btn-ghost btn-sm">すべてクリア</button>
+          <button id="btn-download-all" class="btn btn-success btn-glow">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            <span>すべて一括ダウンロード</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 全体進捗バー -->
+      <div id="batch-progress-container" class="batch-progress-wrapper" style="display: none;">
+        <div class="progress-info">
+          <span id="batch-progress-status">ダウンロード準備中...</span>
+          <span id="batch-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div id="batch-progress-bar" class="progress-fill" style="width: 0%;"></div>
+        </div>
+      </div>
+
+      <!-- 楽曲カード一覧 -->
+      <div id="songs-list" class="songs-grid">
+        <!-- JavaScriptで動的生成 -->
+      </div>
+    </section>
+
+    <!-- フッター -->
+    <footer class="app-footer">
+      <p class="copyright">© 2026 KenmoFM. All Rights Reserved.</p>
+    </footer>
+  </div>
+
+  <!-- トースト通知コンテナ -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
