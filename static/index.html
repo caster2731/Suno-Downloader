@@ -20,9 +20,17 @@
   <div class="app-container">
     <!-- ヘッダー -->
     <header class="app-header">
-      <div class="brand-badge">
-        <span class="pulse-dot"></span>
-        <span>Suno Downloader v1.0</span>
+      <div class="header-top-row">
+        <div class="brand-badge">
+          <span class="pulse-dot"></span>
+          <span>Suno Downloader v1.2</span>
+        </div>
+        <button id="btn-open-ext-modal" class="btn btn-outline-glow btn-sm" title="Suno Web画面にダウンロードボタンを追加">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+          </svg>
+          Suno画面連携 (ブラウザ拡張)
+        </button>
       </div>
       <h1 class="main-title">
         <span class="gradient-text">Suno</span> Music Downloader
@@ -44,14 +52,26 @@
             </svg>
           </div>
           <div>
-            <h2 class="card-title">Sunoの楽曲URLを入力</h2>
-            <p class="card-caption">1行に1つのURL（複数行貼り付け対応、プレイリストやID直接入力も可）</p>
+            <h2 class="card-title">Sunoの楽曲・プレイリストURLを入力</h2>
+            <p class="card-caption">個別曲URL、プレイリストURL、@ユーザーページ、短縮URL、UUID直打ちに全対応</p>
           </div>
         </div>
         <div class="header-actions">
+          <!-- クリップボード自動監視トグル -->
+          <label class="toggle-control" title="コピー（Ctrl+C）したSunoのURLを自動でリストに追加します">
+            <input type="checkbox" id="toggle-clipboard-watch">
+            <span class="toggle-switch"></span>
+            <span class="toggle-label">📋 クリップボード自動監視</span>
+          </label>
+          <!-- 自動ダウンロードチェック -->
+          <label class="toggle-control" title="URL追加時に自動でダウンロードまで完了します">
+            <input type="checkbox" id="toggle-auto-download">
+            <span class="toggle-switch"></span>
+            <span class="toggle-label">⚡ 自動保存</span>
+          </label>
           <button id="btn-sample" class="btn btn-ghost btn-sm" title="テスト用サンプルURLを挿入">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
-            サンプルURLを入力
+            サンプル
           </button>
           <button id="btn-clear-input" class="btn btn-ghost btn-sm" title="入力をクリア">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
@@ -63,7 +83,8 @@
       <div class="textarea-wrapper">
         <textarea id="url-input" class="modern-textarea" rows="4" placeholder="例:
 https://suno.com/song/2e0eec9e-4f86-46c5-9a43-508829fb9d0b
-https://suno.com/song/7b30e35a-f3d0-4340-9087-26b0db791ffa"></textarea>
+https://suno.com/playlist/7b30e35a-f3d0-4340-9087-26b0db791ffa （プレイリスト丸ごと取得）
+https://suno.com/@username （ユーザー公開曲丸ごと取得）"></textarea>
       </div>
 
       <div class="input-bottom-bar">
@@ -147,6 +168,56 @@ https://suno.com/song/7b30e35a-f3d0-4340-9087-26b0db791ffa"></textarea>
     <footer class="app-footer">
       <p class="copyright">© 2026 KenmoFM. All Rights Reserved.</p>
     </footer>
+  </div>
+
+  <!-- ブラウザ連携（Tampermonkey）案内モーダル -->
+  <div id="ext-modal" class="modal-backdrop" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <span class="modal-icon">⚡</span>
+          <h3>Suno Web画面 連携スクリプトの導入</h3>
+        </div>
+        <button id="btn-close-modal" class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">
+          ブラウザ拡張（Tampermonkey等）に専用スクリプトを登録すると、<strong>SunoのWeb画面（ワークスペース・曲一覧）に直接「📥 ダウンロード」ボタンが出現</strong>し、URLコピー不要で1クリック保存できるようになります！
+        </p>
+        <div class="step-box">
+          <div class="step-item">
+            <span class="step-num">1</span>
+            <div>
+              <strong>Tampermonkey（拡張機能）をインストール</strong><br>
+              ブラウザ（Chrome / Edge 等）のウェブストアから「Tampermonkey」を追加します。
+            </div>
+          </div>
+          <div class="step-item">
+            <span class="step-num">2</span>
+            <div>
+              <strong>連携スクリプトをインストール</strong><br>
+              下のボタンを押すと、Tampermonkeyのインストール確認画面が開きます。「インストール」を押してください。
+            </div>
+          </div>
+          <div class="step-item">
+            <span class="step-num">3</span>
+            <div>
+              <strong>Sunoの画面を開いて完了！</strong><br>
+              Sunoのワークスペースで曲を選択すると、画面右下に「📥 選択した曲をダウンロード」ボタンが表示されます。
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-actions-box">
+          <a href="/api/extension/script" target="_blank" class="btn btn-primary btn-glow" style="text-decoration:none;">
+            🚀 スクリプトをインストールする
+          </a>
+          <button id="btn-copy-script-url" class="btn btn-ghost btn-sm">
+            スクリプトURLをコピー
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- トースト通知コンテナ -->

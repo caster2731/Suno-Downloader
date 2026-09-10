@@ -78,6 +78,12 @@ class OpenFolderRequest(BaseModel):
     folder_path: Optional[str] = None
 
 
+class BulkAddRequest(BaseModel):
+    uuids: List[str]
+    auto_download: bool = False
+    format: str = "mp3"
+
+
 # --- APIエンドポイント ---
 
 @app.get("/api/config")
@@ -93,6 +99,7 @@ def get_config():
 def parse_urls(req: ParseRequest):
     """
     入力テキストからSuno楽曲URL/UUIDを抽出し、メタデータ（曲名・アーティスト・画像）を取得します。
+    プレイリストURLやユーザーページURLの場合は複数曲を展開して取得します。
     """
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="URLまたはテキストを入力してください。")
@@ -110,6 +117,85 @@ def parse_urls(req: ParseRequest):
         "count": len(results),
         "songs": results
     }
+
+
+@app.post("/api/bulk_add")
+def bulk_add(req: BulkAddRequest):
+    """
+    ブラウザ拡張機能（Tampermonkey等）や外部から直接楽曲UUID一覧を受け取り、
+    メタデータを取得し、auto_downloadがTrueの場合は即座に高音質ダウンロード＆タグ埋め込みを実行します。
+    """
+    if not req.uuids:
+        raise HTTPException(status_code=400, detail="楽曲UUIDが指定されていません。")
+
+    unique_uuids = []
+    seen = set()
+    for u in req.uuids:
+        clean_u = u.strip().lower()
+        if clean_u and clean_u not in seen:
+            seen.add(clean_u)
+            unique_uuids.append(clean_u)
+
+    results = []
+    for uuid in unique_uuids:
+        meta = suno_service.fetch_song_metadata(uuid)
+        item_res = {
+            "metadata": meta,
+            "download_result": None
+        }
+
+        # auto_downloadが指定されている場合は即時ダウンロード処理を実行
+        if req.auto_download:
+            try:
+                dl_res = suno_service.process_song_download(
+                    uuid=meta["uuid"],
+                    title=meta["title"],
+                    artist=meta["artist"],
+                    image_url=meta["image_url"],
+                    format_type=req.format,
+                    output_dir=str(DEFAULT_DOWNLOADS_DIR),
+                    audio_url=meta.get("audio_url"),
+                    candidate_urls=meta.get("candidate_urls")
+                )
+                item_res["download_result"] = {
+                    "status": "success",
+                    "data": dl_res
+                }
+            except Exception as e:
+                print(f"一括ダウンロード処理エラー ({uuid}): {e}")
+                item_res["download_result"] = {
+                    "status": "error",
+                    "message": str(e)
+                }
+
+        results.append(item_res)
+
+        # 連続ダウンロード時のレートリミット回避インターバル
+        if req.auto_download:
+            import time
+            time.sleep(0.6)
+
+    return {
+        "count": len(results),
+        "songs": results,
+        "auto_download": req.auto_download
+    }
+
+
+@app.get("/api/extension/script")
+def get_extension_script():
+    """
+    Sunoワークスペース連携用のTampermonkeyユーザースクリプトファイルを返却します。
+    ブラウザから直接開くことでワンクリックインストールが可能です。
+    """
+    script_path = STATIC_DIR / "suno_downloader_extension.user.js"
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="スクリプトファイルが見つかりません。")
+    return FileResponse(
+        path=str(script_path),
+        filename="suno_downloader_extension.user.js",
+        media_type="text/javascript"
+    )
 
 
 @app.post("/api/download-single")

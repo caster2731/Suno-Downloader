@@ -10,6 +10,8 @@ import re
 import html
 import tempfile
 import subprocess
+import time
+import threading
 import requests
 from bs4 import BeautifulSoup
 from mutagen.mp4 import MP4, MP4Cover
@@ -22,6 +24,11 @@ import base64
 import hashlib
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+# Sunoサーバーへの同時過密アクセス遮断（レートリミット・連打エラー）を完全に防ぐための直列化ロック＆インターバル
+DOWNLOAD_QUEUE_LOCK = threading.Lock()
+LAST_DOWNLOAD_FINISH_TIME = 0.0
+MIN_DOWNLOAD_GAP_SECONDS = 0.7  # 前の曲の終了から次の曲の開始までの安全インターバル
 
 
 def get_app_dir() -> str:
@@ -75,16 +82,24 @@ UUID_PATTERN = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 # 短縮共有URL（例: https://suno.com/s/CgEpfvk5PAbzzdgy）のパターン
 SHORT_URL_PATTERN = re.compile(r'https?://(?:www\.)?suno\.com/s/[a-zA-Z0-9]+', re.IGNORECASE)
 
+# プレイリストURL（例: https://suno.com/playlist/2e0eec9e-4f86-46c5-9a43-508829fb9d0b）のパターン
+PLAYLIST_PATTERN = re.compile(r'https?://(?:www\.)?suno\.com/playlist/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.IGNORECASE)
+
+# ユーザーページURL（例: https://suno.com/@username）のパターン
+USER_PAGE_PATTERN = re.compile(r'https?://(?:www\.)?suno\.com/@([a-zA-Z0-9_\-\.]+)', re.IGNORECASE)
+
 # 無効なダミー音源や無音ファイルを除外するパターン（SunoのWebオーディオ初期化用sil-100.mp3等）
 DUMMY_AUDIO_PATTERN = re.compile(r'(?:sil-\d+|silence|dummy|blank|preview-snippet|static/audio)', re.IGNORECASE)
 
 
-def fetch_decryption_keys(uuid: str) -> tuple[bytes, bytes] | None:
+def fetch_decryption_keys(uuid: str, max_retries: int = 3) -> tuple[bytes, bytes] | None:
     """
     SunoのストリーミングライセンスAPIから復号鍵とカウンターIVを取得します。
+    混雑やレートリミット対策として最大3回自動リトライします。
     (content_key, content_iv) を返します。失敗時はNoneを返します。
     ※本家の正規ダウンロードボタン（クレジット消費）とは無関係の匿名ストリーミング用鍵APIです。
     """
+    import time
     license_endpoints = [
         "https://studio-api.prod.suno.com/api/mango/rights",
         "https://studio-api-prod.suno.com/api/mango/rights"
@@ -102,46 +117,67 @@ def fetch_decryption_keys(uuid: str) -> tuple[bytes, bytes] | None:
         }
     }
 
-    for ep in license_endpoints:
-        try:
-            r = requests.post(ep, headers=headers, json=payload, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                glt = data.get("glt")
-                key_b64 = data.get("key")
-                iv_b64 = data.get("iv")
-                if glt and key_b64 and iv_b64:
-                    user_key = hashlib.sha256(glt.encode('utf-8')).digest()
-                    wrapped_key = base64.b64decode(key_b64)
-                    wrapped_iv = base64.b64decode(iv_b64)
-                    aad = uuid.encode('utf-8')
-                    aesgcm = AESGCM(user_key)
-                    content_key = aesgcm.decrypt(wrapped_key[:12], wrapped_key[12:], aad)
-                    content_iv = aesgcm.decrypt(wrapped_iv[:12], wrapped_iv[12:], aad)
-                    return content_key, content_iv
-        except Exception as e:
-            print(f"[{uuid}] ライセンスサーバー取得試行エラー ({ep}): {e}")
+    for attempt in range(max_retries):
+        for ep in license_endpoints:
+            try:
+                r = requests.post(ep, headers=headers, json=payload, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    glt = data.get("glt")
+                    key_b64 = data.get("key")
+                    iv_b64 = data.get("iv")
+                    if glt and key_b64 and iv_b64:
+                        user_key = hashlib.sha256(glt.encode('utf-8')).digest()
+                        wrapped_key = base64.b64decode(key_b64)
+                        wrapped_iv = base64.b64decode(iv_b64)
+                        aad = uuid.encode('utf-8')
+                        aesgcm = AESGCM(user_key)
+                        content_key = aesgcm.decrypt(wrapped_key[:12], wrapped_key[12:], aad)
+                        content_iv = aesgcm.decrypt(wrapped_iv[:12], wrapped_iv[12:], aad)
+                        return content_key, content_iv
+                elif r.status_code in (429, 502, 503, 504):
+                    print(f"[{uuid}] ライセンスAPI一時過負荷 (HTTP {r.status_code})。リトライ待機中...")
+            except Exception as e:
+                print(f"[{uuid}] ライセンスサーバー取得試行エラー ({ep}, 試行 {attempt + 1}/{max_retries}): {e}")
+
+        if attempt < max_retries - 1:
+            time.sleep(0.8 * (attempt + 1))
 
     return None
 
 
+def is_encrypted_stream(filepath: str) -> bool:
+    """
+    ファイルの先頭ヘッダー（マジックナンバー）を検査し、
+    Sunoの暗号化ストリームかどうかを高速・無音で判定します。
+    """
+    if not os.path.exists(filepath):
+        return False
+    try:
+        with open(filepath, "rb") as f:
+            header = f.read(32)
+        # 正常な音声ヘッダー（mp4/m4aのftyp, mp3のID3/0xFF, OggS, RIFF等）が存在する場合は暗号化されていない
+        if b"ftyp" in header or header.startswith(b"ID3") or header.startswith(b"\xff\xfb") or header.startswith(b"OggS") or header.startswith(b"RIFF"):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def try_decrypt_audio_file(filepath: str, uuid: str) -> bool:
     """
-    指定されたファイルが暗号化ストリームの場合、AES-128-CTRで復号して上書き保存します。
-    成功した場合はTrue、復号不要または失敗時はFalseを返します。
+    指定された暗号化ストリームをSunoの匿名鍵APIを用いてAES-128-CTRで復号し、正常な音声として上書き保存します。
+    成功時はTrue、失敗時はFalseを返します。
     """
     if not os.path.exists(filepath):
         return False
 
-    with open(filepath, "rb") as f:
-        header = f.read(16)
-
-    # 既に正常なmp4/m4a（ftyp）またはmp3（ID3/0xFF）なら復号不要
-    if b"ftyp" in header or header.startswith(b"ID3") or header.startswith(b"\xff\xfb") or header.startswith(b"OggS"):
-        return False
+    if not is_encrypted_stream(filepath):
+        return True  # 既に復号済みまたは非暗号化
 
     keys = fetch_decryption_keys(uuid)
     if not keys:
+        print(f"[{uuid}] 復号キーの取得に失敗しました。")
         return False
 
     content_key, content_iv = keys
@@ -155,10 +191,10 @@ def try_decrypt_audio_file(filepath: str, uuid: str) -> bool:
 
         with open(filepath, "wb") as f:
             f.write(decrypted_data)
-        print(f"[{uuid}] 暗号化ストリームの自動復号に成功しました！(サイズ: {len(decrypted_data)} bytes)")
+        print(f"[{uuid}] 音声ストリームの自動復号に成功しました（{len(decrypted_data)} bytes）")
         return True
     except Exception as e:
-        print(f"[{uuid}] 音声データの復号処理エラー: {e}")
+        print(f"[{uuid}] 音声データの復号エラー: {e}")
         return False
 
 
@@ -188,22 +224,122 @@ def resolve_short_url(short_url: str) -> str | None:
     return None
 
 
+def resolve_playlist_uuids(playlist_id: str) -> list[str]:
+    """
+    SunoのプレイリストIDから、含まれるすべての楽曲UUIDを取得します。
+    APIおよび公開HTMLの両面から楽曲リストを抽出します。
+    """
+    found_uuids = []
+    seen = set()
+
+    # 1. Suno公式プレイリストAPIを試行
+    api_url = f"https://studio-api.prod.suno.com/api/playlist/{playlist_id}?page=1"
+    try:
+        r = requests.get(api_url, headers=DEFAULT_HEADERS, timeout=12)
+        if r.status_code == 200:
+            data = r.json()
+            clips = data.get("playlist_clips", []) or data.get("clips", [])
+            for c in clips:
+                clip_obj = c.get("clip") if isinstance(c.get("clip"), dict) else c
+                cid = clip_obj.get("id")
+                if cid and cid.lower() not in seen and cid.lower() != playlist_id.lower():
+                    seen.add(cid.lower())
+                    found_uuids.append(cid.lower())
+            if found_uuids:
+                print(f"プレイリストAPIから {len(found_uuids)} 曲のUUIDを取得しました (ID: {playlist_id})")
+                return found_uuids
+    except Exception as e:
+        print(f"プレイリストAPI取得試行エラー ({playlist_id}): {e}")
+
+    # 2. 公開HTMLページから楽曲リンク（/song/<uuid>）を抽出
+    page_url = f"https://suno.com/playlist/{playlist_id}"
+    try:
+        r = requests.get(page_url, headers=DEFAULT_HEADERS, timeout=12)
+        if r.status_code == 200:
+            # HTML内の /song/<uuid> 形式を探索
+            song_links = re.findall(r'/song/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', r.text, re.IGNORECASE)
+            for sid in song_links:
+                sid_lower = sid.lower()
+                if sid_lower not in seen and sid_lower != playlist_id.lower():
+                    seen.add(sid_lower)
+                    found_uuids.append(sid_lower)
+
+            # JSONデータ内のUUIDも探索
+            all_uuids = UUID_PATTERN.findall(r.text)
+            for uid in all_uuids:
+                uid_lower = uid.lower()
+                if uid_lower not in seen and uid_lower != playlist_id.lower():
+                    seen.add(uid_lower)
+                    found_uuids.append(uid_lower)
+
+            print(f"プレイリストWebページから {len(found_uuids)} 曲のUUIDを取得しました (ID: {playlist_id})")
+    except Exception as e:
+        print(f"プレイリストWebページ取得エラー ({playlist_id}): {e}")
+
+    return found_uuids
+
+
+def resolve_user_page_uuids(handle: str) -> list[str]:
+    """
+    Sunoのユーザープロフィールページ（@handle）から公開されている楽曲UUIDを取得します。
+    """
+    found_uuids = []
+    seen = set()
+
+    # ユーザーページのHTML取得
+    page_url = f"https://suno.com/@{handle}"
+    try:
+        r = requests.get(page_url, headers=DEFAULT_HEADERS, timeout=12)
+        if r.status_code == 200:
+            song_links = re.findall(r'/song/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', r.text, re.IGNORECASE)
+            for sid in song_links:
+                sid_lower = sid.lower()
+                if sid_lower not in seen:
+                    seen.add(sid_lower)
+                    found_uuids.append(sid_lower)
+            print(f"ユーザーページ(@{handle})から {len(found_uuids)} 曲のUUIDを取得しました")
+    except Exception as e:
+        print(f"ユーザーページ取得エラー (@{handle}): {e}")
+
+    return found_uuids
+
+
 def extract_uuids(text: str) -> list[str]:
     """
-    入力されたテキスト（通常URL、短縮URL、UUID直打ち）からSunoの楽曲UUIDを抽出し、重複を排除して返します。
+    入力されたテキスト（通常URL、短縮URL、UUID直打ち、プレイリストURL、ユーザーページURL）から
+    Sunoの楽曲UUIDをすべて抽出し、重複を排除して返します。
     """
     unique_uuids = []
     seen = set()
 
-    # 1. 通常のUUIDパターン（URL内や直打ち）を抽出
+    # 1. プレイリストURL（https://suno.com/playlist/...）を展開
+    playlists = PLAYLIST_PATTERN.findall(text)
+    for p_id in playlists:
+        p_uuids = resolve_playlist_uuids(p_id)
+        for u in p_uuids:
+            if u not in seen:
+                seen.add(u)
+                unique_uuids.append(u)
+
+    # 2. ユーザーページURL（https://suno.com/@username）を展開
+    users = USER_PAGE_PATTERN.findall(text)
+    for handle in users:
+        u_uuids = resolve_user_page_uuids(handle)
+        for u in u_uuids:
+            if u not in seen:
+                seen.add(u)
+                unique_uuids.append(u)
+
+    # 3. 通常のUUIDパターン（URL内や直打ち）を抽出（プレイリストIDとして既に処理されたもの以外）
     direct_uuids = UUID_PATTERN.findall(text)
+    playlist_ids_set = set(p.lower() for p in playlists)
     for item in direct_uuids:
         lower_item = item.lower()
-        if lower_item not in seen:
+        if lower_item not in seen and lower_item not in playlist_ids_set:
             seen.add(lower_item)
             unique_uuids.append(lower_item)
 
-    # 2. 短縮URL（https://suno.com/s/...）を抽出して解決
+    # 4. 短縮URL（https://suno.com/s/...）を抽出して解決
     short_urls = SHORT_URL_PATTERN.findall(text)
     for s_url in short_urls:
         resolved_uuid = resolve_short_url(s_url)
@@ -226,14 +362,15 @@ def sanitize_filename(name: str) -> str:
 def extract_audio_candidates_from_text(text: str, uuid: str) -> list[str]:
     """
     SunoページのHTMLや埋め込みデータから音源URL候補を抽出し、
-    無音ダミーファイルを除外した上で優先順位をつけて返します。
+    無音ダミーファイルを除外した上で最新の有効ストリームを最優先にして返します。
     """
     uuid_lower = uuid.lower()
     high_priority = []
     normal_priority = []
+    fallback_priority = []
     seen = set()
 
-    def add_candidate(u: str):
+    def add_candidate(u: str, is_fallback: bool = False):
         if not u or not isinstance(u, str):
             return
         u = u.strip().replace("\\u0026", "&").replace("&amp;", "&")
@@ -246,8 +383,10 @@ def extract_audio_candidates_from_text(text: str, uuid: str) -> list[str]:
             return
         seen.add(u)
 
-        # 該当UUIDが含まれているURLは最優先（本物の個別曲ストリーム）
-        if uuid_lower in u.lower():
+        if is_fallback:
+            fallback_priority.append(u)
+        elif uuid_lower in u.lower():
+            # 該当UUIDが含まれている本物の個別ストリームを最優先
             high_priority.append(u)
         else:
             normal_priority.append(u)
@@ -259,28 +398,26 @@ def extract_audio_candidates_from_text(text: str, uuid: str) -> list[str]:
         for u in urls:
             add_candidate(u)
 
-    # 2. 安定して高品質フル音源を提供する公式CDNストリーム
-    add_candidate(f"https://cdn1.suno.ai/{uuid}.mp4")
-
-    # 3. audio_url フィールドからの抽出
+    # 2. audio_url フィールドからの抽出
     m_audio = re.findall(r'"audio_url"\s*:\s*"([^"]+)"', text)
     for u in m_audio:
         add_candidate(u)
 
-    # 4. 直接の音声配信URLパターン（m4a, mp3, mp4等）を正規表現で探索
+    # 3. 直接の音声配信URLパターン（m4a, mp3, mp4等）を正規表現で探索
     direct_urls = re.findall(r'(https?://[^\s"\'<>]+\.(?:m4a|mp3|mp4)(?:\?[^\s"\'<>]*)?)', text)
     for u in direct_urls:
         add_candidate(u)
 
-    # 5. 代替CDNフォールバックURL
+    # 4. 代替CDNフォールバックURL（最新楽曲では403拒否されることが多いため後回し）
     fallback_urls = [
+        f"https://cdn1.suno.ai/{uuid}.mp4",
         f"https://cdn1.suno.ai/{uuid}.mp3",
         f"https://audiopipe.suno.ai/?item_id={uuid}"
     ]
     for u in fallback_urls:
-        add_candidate(u)
+        add_candidate(u, is_fallback=True)
 
-    return high_priority + normal_priority
+    return high_priority + normal_priority + fallback_priority
 
 
 def fetch_song_metadata(uuid: str) -> dict:
@@ -457,64 +594,76 @@ def download_audio_from_candidates(uuid: str, candidates: list[str], tmpdir: str
     """
     候補URLを優先順に試行し、正常な音声データであることをffprobeで厳格に検証した上で
     ローカルファイルに保存します。暗号化されている場合は自動復号します。
+    通信切断や一時エラーに対するリトライ機能を備えています。
     (保存ファイルパス, 成功URL) を返します。
     """
+    import time
     last_error = None
     for url in candidates:
-        try:
-            print(f"[{uuid}] 音源ダウンロード試行中: {url}")
-            resp = requests.get(url, headers=DEFAULT_HEADERS, stream=True, timeout=30)
-            if resp.status_code == 200:
-                lower_url = url.lower().split("?")[0]
-                if lower_url.endswith(".mp3"):
-                    ext = ".mp3"
-                elif lower_url.endswith(".mp4"):
-                    ext = ".mp4"
-                elif lower_url.endswith(".opus"):
-                    ext = ".opus"
+        # 1候補につき最大2回試行
+        for attempt in range(2):
+            try:
+                print(f"[{uuid}] 音源ダウンロード試行中: {url}")
+                resp = requests.get(url, headers=DEFAULT_HEADERS, stream=True, timeout=30)
+                if resp.status_code == 200:
+                    lower_url = url.lower().split("?")[0]
+                    if lower_url.endswith(".mp3"):
+                        ext = ".mp3"
+                    elif lower_url.endswith(".mp4"):
+                        ext = ".mp4"
+                    elif lower_url.endswith(".opus"):
+                        ext = ".opus"
+                    else:
+                        ext = ".m4a"
+
+                    target_file = os.path.join(tmpdir, f"{uuid}_source{ext}")
+
+                    first_chunk = None
+                    with open(target_file, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            if chunk:
+                                if first_chunk is None:
+                                    first_chunk = chunk
+                                    if (chunk.strip().startswith(b"<!DOCTYPE") or
+                                        chunk.strip().startswith(b"<html") or
+                                        chunk.strip().startswith(b"<?xml") or
+                                        chunk.strip().startswith(b"{\"")):
+                                        raise RuntimeError("返却されたデータが音声ファイルではなくHTML/XML/JSONです")
+                                f.write(chunk)
+
+                    # 1. 暗号化ストリームかヘッダーで事前判定し、必要なら即座に自動復号
+                    if is_encrypted_stream(target_file):
+                        print(f"[{uuid}] 暗号化ストリームを検知しました。高音質音源を自動復号中...")
+                        try_decrypt_audio_file(target_file, uuid)
+
+                    # 2. 復号された音声データに対して完全性・再生時間（Duration）チェック
+                    is_valid, duration, reason = verify_audio_file(target_file)
+
+                    if is_valid:
+                        print(f"[{uuid}] 音源取得＆検証成功: {url} ({os.path.getsize(target_file)} bytes, 再生時間: {duration:.1f}秒, 形式: {ext})")
+                        return target_file, url
+                    else:
+                        print(f"[{uuid}] 音源データが無効と判定されました ({reason})。次の候補を試行します: {url}")
+                        last_error = reason
+                        if os.path.exists(target_file):
+                            try:
+                                os.remove(target_file)
+                            except OSError:
+                                pass
+                        break  # ダウンロードできたが無効データの場合は再試行せず次のURL候補へ
+                elif resp.status_code == 403:
+                    # 403 Forbidden（古いCDN等）はリトライ不要で即次の候補へ
+                    print(f"[{uuid}] アクセス拒否または未検出（ステータスコード: 403）: {url}")
+                    last_error = "ステータスコード 403"
+                    break
                 else:
-                    ext = ".m4a"
-
-                target_file = os.path.join(tmpdir, f"{uuid}_source{ext}")
-
-                first_chunk = None
-                with open(target_file, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        if chunk:
-                            if first_chunk is None:
-                                first_chunk = chunk
-                                if (chunk.strip().startswith(b"<!DOCTYPE") or
-                                    chunk.strip().startswith(b"<html") or
-                                    chunk.strip().startswith(b"<?xml") or
-                                    chunk.strip().startswith(b"{\"")):
-                                    raise RuntimeError("返却されたデータが音声ファイルではなくHTML/XML/JSONです")
-                            f.write(chunk)
-
-                # 1. 音声データの完全性・再生時間（Duration）チェック
-                is_valid, duration, reason = verify_audio_file(target_file)
-                if not is_valid:
-                    # 2. 暗号化ストリーム（AES-128-CTR）の自動復号を試行
-                    print(f"[{uuid}] 通常の音声解析に失敗 ({reason})。暗号化ストリームの自動復号を試行します...")
-                    if try_decrypt_audio_file(target_file, uuid):
-                        is_valid, duration, reason = verify_audio_file(target_file)
-
-                if is_valid:
-                    print(f"[{uuid}] 音源取得＆検証成功: {url} ({os.path.getsize(target_file)} bytes, 再生時間: {duration:.1f}秒, 形式: {ext})")
-                    return target_file, url
-                else:
-                    print(f"[{uuid}] 音源データが無効と判定されました ({reason})。次の候補を試行します: {url}")
-                    last_error = reason
-                    if os.path.exists(target_file):
-                        try:
-                            os.remove(target_file)
-                        except OSError:
-                            pass
-            else:
-                print(f"[{uuid}] アクセス拒否または未検出（ステータスコード: {resp.status_code}）: {url}")
-                last_error = f"ステータスコード {resp.status_code}"
-        except Exception as e:
-            print(f"[{uuid}] ダウンロード試行失敗 ({url}): {e}")
-            last_error = str(e)
+                    print(f"[{uuid}] アクセス拒否または未検出（ステータスコード: {resp.status_code}）: {url}")
+                    last_error = f"ステータスコード {resp.status_code}"
+            except Exception as e:
+                print(f"[{uuid}] ダウンロード試行失敗 ({url}, 試行 {attempt + 1}/2): {e}")
+                last_error = str(e)
+                if attempt == 0:
+                    time.sleep(0.5)
 
     raise RuntimeError(f"すべての候補URLからの音源取得に失敗しました（最後のエラー: {last_error}）。楽曲が非公開になっているか、URLが正しくない可能性があります。")
 
@@ -533,6 +682,46 @@ def process_song_download(
     """
     音源をダウンロードし、選択した形式（MP3またはM4A）に変換して、
     公式アートワークとメタデータを埋め込みます。
+    複数リクエストの連打・同時押し時も排他ロック（キュー）で1曲ずつ安全な間隔を空けて処理します。
+    """
+    global LAST_DOWNLOAD_FINISH_TIME
+
+    with DOWNLOAD_QUEUE_LOCK:
+        now = time.time()
+        elapsed = now - LAST_DOWNLOAD_FINISH_TIME
+        if elapsed < MIN_DOWNLOAD_GAP_SECONDS:
+            wait_sec = MIN_DOWNLOAD_GAP_SECONDS - elapsed
+            print(f"[{uuid}] 連打・過密アクセス防止のため {wait_sec:.2f} 秒待機中...")
+            time.sleep(wait_sec)
+
+        try:
+            res = _execute_song_download(
+                uuid=uuid,
+                title=title,
+                artist=artist,
+                image_url=image_url,
+                format_type=format_type,
+                output_dir=output_dir,
+                audio_url=audio_url,
+                candidate_urls=candidate_urls
+            )
+            return res
+        finally:
+            LAST_DOWNLOAD_FINISH_TIME = time.time()
+
+
+def _execute_song_download(
+    uuid: str,
+    title: str,
+    artist: str,
+    image_url: str,
+    format_type: str,
+    output_dir: str,
+    audio_url: str = None,
+    candidate_urls: list = None
+) -> dict:
+    """
+    実際のダウンロード、フォーマット変換、アートワーク・メタデータ埋め込み処理を実行します。
     """
     os.makedirs(output_dir, exist_ok=True)
     format_type = format_type.lower()

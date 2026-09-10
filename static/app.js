@@ -8,7 +8,10 @@ const state = {
   currentAudio: null,
   currentPlayingUuid: null,
   defaultDownloadDir: "",
-  isDownloadingAll: false
+  isDownloadingAll: false,
+  isClipboardWatchActive: false,
+  isAutoDownloadActive: false,
+  lastClipboardText: ""
 };
 
 // サンプルURL（動作確認用）
@@ -35,6 +38,14 @@ const batchProgressBar = document.getElementById("batch-progress-bar");
 const batchProgressStatus = document.getElementById("batch-progress-status");
 const batchProgressPercent = document.getElementById("batch-progress-percent");
 const toastContainer = document.getElementById("toast-container");
+
+// 新機能用DOM要素
+const toggleClipboardWatch = document.getElementById("toggle-clipboard-watch");
+const toggleAutoDownload = document.getElementById("toggle-auto-download");
+const btnOpenExtModal = document.getElementById("btn-open-ext-modal");
+const extModal = document.getElementById("ext-modal");
+const btnCloseModal = document.getElementById("btn-close-modal");
+const btnCopyScriptUrl = document.getElementById("btn-copy-script-url");
 
 // --- 初期化 ---
 document.addEventListener("DOMContentLoaded", () => {
@@ -72,7 +83,7 @@ function bindEvents() {
   });
 
   // メタデータ取得ボタン
-  btnFetch.addEventListener("click", handleFetchMetadata);
+  btnFetch.addEventListener("click", () => handleFetchMetadata());
 
   // 保存先フォルダを開く
   btnOpenFolder.addEventListener("click", () => {
@@ -106,6 +117,111 @@ function bindEvents() {
       showToast(`一括ダウンロード形式を [${newFmt.toUpperCase()}] に設定しました`, "info");
     });
   });
+
+  // --- クリップボード自動監視トグル ---
+  if (toggleClipboardWatch) {
+    toggleClipboardWatch.addEventListener("change", (e) => {
+      state.isClipboardWatchActive = e.target.checked;
+      if (state.isClipboardWatchActive) {
+        showToast("📋 クリップボード自動監視を有効化しました（Ctrl+Cで自動検知）", "success");
+        startClipboardWatcher();
+      } else {
+        showToast("クリップボード自動監視を停止しました", "info");
+        stopClipboardWatcher();
+      }
+    });
+  }
+
+  // 自動保存トグル
+  if (toggleAutoDownload) {
+    toggleAutoDownload.addEventListener("change", (e) => {
+      state.isAutoDownloadActive = e.target.checked;
+      if (state.isAutoDownloadActive) {
+        showToast("⚡ 自動保存をONにしました（検知と同時に即ダウンロード開始）", "success");
+      }
+    });
+  }
+
+  // --- 拡張機能案内モーダル ---
+  if (btnOpenExtModal) {
+    btnOpenExtModal.addEventListener("click", () => {
+      extModal.style.display = "flex";
+    });
+  }
+
+  if (btnCloseModal) {
+    btnCloseModal.addEventListener("click", () => {
+      extModal.style.display = "none";
+    });
+  }
+
+  if (extModal) {
+    extModal.addEventListener("click", (e) => {
+      if (e.target === extModal) {
+        extModal.style.display = "none";
+      }
+    });
+  }
+
+  if (btnCopyScriptUrl) {
+    btnCopyScriptUrl.addEventListener("click", () => {
+      const url = `${window.location.origin}/api/extension/script`;
+      navigator.clipboard.writeText(url).then(() => {
+        showToast("スクリプトURLをクリップボードにコピーしました！", "success");
+      }).catch(() => {
+        showToast("URLのコピーに失敗しました", "error");
+      });
+    });
+  }
+}
+
+// --- クリップボード監視ロジック ---
+let clipboardTimer = null;
+
+function startClipboardWatcher() {
+  stopClipboardWatcher();
+  // 初回チェック
+  checkClipboard();
+  // 定期ポーリング（1.5秒おき）
+  clipboardTimer = setInterval(checkClipboard, 1500);
+  // ウィンドウ復帰時にも即座にチェック
+  window.addEventListener("focus", checkClipboard);
+}
+
+function stopClipboardWatcher() {
+  if (clipboardTimer) {
+    clearInterval(clipboardTimer);
+    clipboardTimer = null;
+  }
+  window.removeEventListener("focus", checkClipboard);
+}
+
+async function checkClipboard() {
+  if (!state.isClipboardWatchActive) return;
+
+  try {
+    if (!navigator.clipboard || !navigator.clipboard.readText) {
+      return;
+    }
+    const text = await navigator.clipboard.readText();
+    if (!text || typeof text !== "string") return;
+
+    const trimmed = text.trim();
+    if (trimmed === state.lastClipboardText) return;
+
+    // Suno関連のURLまたはUUIDが含まれているかチェック
+    const isSunoUrl = /suno\.com\/(?:song|s|playlist|@)/i.test(trimmed) ||
+                      /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(trimmed);
+
+    if (isSunoUrl) {
+      state.lastClipboardText = trimmed;
+      showToast("📋 クリップボードからSunoのURLを検知しました！", "info");
+      // 自動で取得処理を実行
+      handleFetchMetadata(trimmed, state.isAutoDownloadActive);
+    }
+  } catch (e) {
+    // クリップボード読み取り権限がない場合は静かに無視
+  }
 }
 
 // 選択中のグローバル形式を取得
@@ -115,8 +231,8 @@ function getGlobalFormat() {
 }
 
 // --- 楽曲情報取得処理 ---
-async function handleFetchMetadata() {
-  const text = urlInput.value.trim();
+async function handleFetchMetadata(customText = null, shouldAutoDownload = false) {
+  const text = customText ? customText.trim() : urlInput.value.trim();
   if (!text) {
     showToast("URLを入力してください。", "error");
     urlInput.focus();
@@ -148,25 +264,41 @@ async function handleFetchMetadata() {
     // 重複を避けてリストに追加
     const currentGlobalFmt = getGlobalFormat();
     let addedCount = 0;
+    const newSongsToDownload = [];
 
     data.songs.forEach(newSong => {
       const exists = state.songs.some(s => s.uuid === newSong.uuid);
       if (!exists) {
-        state.songs.push({
+        const item = {
           ...newSong,
           format: currentGlobalFmt,
           status: "waiting", // waiting | downloading | success | error
           statusText: "待機中",
           fileInfo: null,
           completed: false
-        });
+        };
+        state.songs.push(item);
+        newSongsToDownload.push(item);
         addedCount++;
       }
     });
 
     renderSongs();
-    showToast(`${addedCount}曲の情報を取得しました！`, "success");
-    urlInput.value = ""; // 入力欄をクリア
+    if (addedCount > 0) {
+      showToast(`${addedCount}曲の情報を取得しました！`, "success");
+      if (!customText) {
+        urlInput.value = ""; // 入力欄をクリア
+      }
+
+      // 自動保存が有効なら即座にダウンロード開始
+      if (shouldAutoDownload || state.isAutoDownloadActive) {
+        for (const item of newSongsToDownload) {
+          downloadSingle(item.uuid);
+        }
+      }
+    } else {
+      showToast("既にリストに追加済みの楽曲です", "info");
+    }
 
   } catch (err) {
     showToast(err.message || "通信エラーが発生しました。", "error");
@@ -390,6 +522,11 @@ async function handleDownloadAll() {
     await downloadSingle(song.uuid);
     if (song.completed) {
       successCount++;
+    }
+
+    // Sunoサーバーへのレートリミット（429 / 403過密アクセス）防止のための安全インターバル
+    if (i < total - 1) {
+      await new Promise(r => setTimeout(r, 800));
     }
   }
 
