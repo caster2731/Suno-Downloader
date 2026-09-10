@@ -65,3 +65,9 @@ python app.py
   - `fastapi`, `uvicorn` (Web APIサーバー)
   - `requests`, `beautifulsoup4` (Sunoデータ取得)
   - `mutagen` (ID3v2 / MP4タグ・アートワーク埋め込み)
+
+---
+
+## ライセンス
+
+本プロジェクトは [MIT License](LICENSE) のもとで公開されています。
